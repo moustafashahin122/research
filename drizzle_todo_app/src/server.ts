@@ -3,10 +3,9 @@ import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { createYoga } from "graphql-yoga";
 import { buildSchema } from "./graphql/index.js";
-import { db } from "./db.js";
-import * as dbSchema from "./schema.js";
+import * as dbModule from "./db.js";
 
-const { schema } = buildSchema(db, dbSchema);
+const { schema } = buildSchema(dbModule.db, dbModule);
 
 const yoga = createYoga({
   schema,

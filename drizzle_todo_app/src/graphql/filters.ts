@@ -258,8 +258,49 @@ export function orderByToSql(
 }
 
 /**
- * @internal
- * Re-exported placeholder kept for incremental refactors (the builder uses
- * `GraphQLInt` directly for `limit`/`offset`); not part of the public API.
+ * Standard list-query args: a where input, ordering, and pagination.
+ *
+ * Shared between the auto-generated root list/single queries and the
+ * relation-field "many" resolver, which all accept the same vocabulary.
  */
-export const queryArgsType = { GraphQLInt };
+export interface ListArgs {
+  where?: Record<string, any> | null;
+  orderBy?: Record<string, "asc" | "desc"> | null;
+  limit?: number | null;
+  offset?: number | null;
+}
+
+/**
+ * Apply the standard list-query args to a Drizzle select query.
+ *
+ * Composes user-supplied `where` ({@link whereToSql}) with an optional
+ * `extraWhere` (AND-combined — useful for relation joins where the parent
+ * row's local key is fixed), then chains `orderBy` ({@link orderByToSql}),
+ * `limit`, and `offset` when present.
+ *
+ * Drizzle's query builder is mutable along the call chain; this helper
+ * returns the same builder instance for ergonomic chaining (e.g. appending
+ * `.limit(1)` for single-row queries).
+ *
+ * @param query A Drizzle select query (`db.select().from(table)`).
+ * @param args Caller-supplied {@link ListArgs} (`null`/`undefined` allowed).
+ * @param columns The table's GraphQL-field → column map.
+ * @param extraWhere Optional pre-computed condition AND-ed with `args.where`.
+ */
+export function applyListArgs<Q>(
+  query: Q,
+  args: ListArgs | null | undefined,
+  columns: ColumnMap,
+  extraWhere?: SQL,
+): Q {
+  const userWhere = whereToSql(args?.where, columns);
+  const combined =
+    extraWhere && userWhere ? and(extraWhere, userWhere) : extraWhere ?? userWhere;
+  let q: any = (query as any).where(combined);
+  const order = orderByToSql(args?.orderBy, columns);
+  if (order.length) q = q.orderBy(...order);
+  if (args?.limit != null) q = q.limit(args.limit);
+  if (args?.offset != null) q = q.offset(args.offset);
+  return q as Q;
+}
+

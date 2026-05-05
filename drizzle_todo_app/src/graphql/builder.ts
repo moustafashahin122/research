@@ -74,19 +74,19 @@ import {
   eq,
   getTableColumns,
   getTableName,
-  inArray,
   type Column,
   type SQL,
 } from "drizzle-orm";
 import {
+  applyListArgs,
   buildOrderByInput,
   buildWhereInput,
-  orderByToSql,
   whereToSql,
   type ColumnMap,
 } from "./filters.js";
 import { introspectSchema, type ExtractedRelation } from "./relations.js";
 import { columnToBaseType, wrapNonNull } from "./types.js";
+import { jsKeyOf } from "./util.js";
 
 /**
  * Structural shape of a Drizzle DB instance accepted by {@link buildSchema}.
@@ -312,10 +312,12 @@ function buildObjectFields(
  * the root, so nested selections traverse through {@link buildObjectFields}
  * again.
  *
- * Local/foreign columns come from the {@link ExtractedRelation} (explicit
- * `relations(...)` declarations or auto-derived FK/inverse). When a "many"
- * relation has no derived back-side, {@link guessForeignColumns} provides a
- * convention-based fallback (`<singularizedParentKey>Id`).
+ * Local/foreign columns come from the {@link ExtractedRelation} — populated
+ * by {@link introspectSchema} from explicit `relations(...)` declarations,
+ * auto-detected inline FKs (forward and inverse), or back-fill from a paired
+ * `one`/`many` declaration. If a relation reaches this resolver without
+ * resolved columns, it means the schema can't actually express the join, and
+ * the field returns `null` / `[]` rather than guessing.
  */
 function buildRelationField(
   rel: ExtractedRelation,
@@ -340,63 +342,29 @@ function buildRelationField(
         }
       : undefined,
     resolve: async (parent, args) => {
-      const localCols = rel.fields ?? parentMeta.pkColumns;
-      const refCols = rel.references ?? guessForeignColumns(parentMeta, refMeta);
+      const localCols = rel.fields;
+      const refCols = rel.references;
       if (!localCols?.length || !refCols?.length) return isMany ? [] : null;
 
       const conds: SQL[] = [];
       for (let i = 0; i < refCols.length; i++) {
-        const localKey = jsKeyOfColumn(parentMeta.columns, localCols[i]);
+        const localKey = jsKeyOf(parentMeta.columns, localCols[i]);
         if (!localKey) return isMany ? [] : null;
         const v = parent?.[localKey];
         if (v === undefined || v === null) return isMany ? [] : null;
         conds.push(eq(refCols[i], v));
       }
 
-      const where = combineWhere(
-        conds.length === 1 ? conds[0] : and(...conds),
-        whereToSql(args?.where, refMeta.columns),
+      const joinSql = conds.length === 1 ? conds[0] : and(...conds);
+      const rows = await applyListArgs(
+        db.select().from(refMeta.table as any),
+        args,
+        refMeta.columns,
+        joinSql,
       );
-      const order = orderByToSql(args?.orderBy, refMeta.columns);
-
-      let q = db.select().from(refMeta.table as any).where(where);
-      if (order.length) q = q.orderBy(...order);
-      if (args?.limit != null) q = q.limit(args.limit);
-      if (args?.offset != null) q = q.offset(args.offset);
-      const rows = await q;
       return isMany ? rows : rows[0] ?? null;
     },
   };
-}
-
-/** Reverse-lookup the JS key of a Drizzle column inside a {@link ColumnMap}. */
-function jsKeyOfColumn(columns: ColumnMap, col: Column): string | undefined {
-  for (const [k, c] of Object.entries(columns)) if (c === col) return k;
-  return undefined;
-}
-
-/**
- * Fallback for "many" relations when the referenced columns aren't known:
- * looks for a `<singularizedParentKey>Id` column on the referenced table
- * (e.g. parent `users` ⇒ `userId`). Returns `undefined` if no convention match.
- */
-function guessForeignColumns(parent: TableMeta, ref: TableMeta): Column[] | undefined {
-  const candidate = `${singularize(parent.jsKey)}Id`;
-  const col = ref.columns[candidate];
-  return col ? [col] : undefined;
-}
-
-/** Naive English singularizer used only by {@link guessForeignColumns}. */
-function singularize(s: string): string {
-  if (s.endsWith("ies")) return s.slice(0, -3) + "y";
-  if (s.endsWith("s")) return s.slice(0, -1);
-  return s;
-}
-
-/** AND-combine two optional Drizzle SQL fragments, dropping `undefined`s. */
-function combineWhere(a: SQL | undefined, b: SQL | undefined): SQL | undefined {
-  if (a && b) return and(a, b);
-  return a ?? b;
 }
 
 /**
@@ -418,40 +386,58 @@ function addRootFields(
   mutationFields: GraphQLFieldConfigMap<unknown, unknown>,
   db: DrizzleLike,
 ) {
-  const listType = new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(meta.objectType)));
+  queryFields[meta.jsKey] = buildListQueryField(meta, db);
+  queryFields[`${meta.jsKey}Single`] = buildSingleQueryField(meta, db);
+  mutationFields[`insertInto${meta.typeName}`] = buildInsertMutationField(meta, db);
+  mutationFields[`update${meta.typeName}`] = buildUpdateMutationField(meta, db);
+  mutationFields[`deleteFrom${meta.typeName}`] = buildDeleteMutationField(meta, db);
+}
 
-  queryFields[meta.jsKey] = {
-    type: listType,
-    args: {
-      where: { type: meta.whereInput },
-      orderBy: { type: meta.orderByInput },
-      limit: { type: GraphQLInt },
-      offset: { type: GraphQLInt },
-    },
-    resolve: async (_, args) => {
-      let q = db.select().from(meta.table).where(whereToSql(args?.where, meta.columns));
-      const order = orderByToSql(args?.orderBy, meta.columns);
-      if (order.length) q = q.orderBy(...order);
-      if (args?.limit != null) q = q.limit(args.limit);
-      if (args?.offset != null) q = q.offset(args.offset);
-      return q;
-    },
+/** Non-null list of the table's object type — used as the return type of all list/mutation root fields. */
+function listType(meta: TableMeta) {
+  return new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(meta.objectType)));
+}
+
+/** Standard `(where?, orderBy?, limit?, offset?)` arg map for list queries. */
+function listArgsConfig(meta: TableMeta) {
+  return {
+    where: { type: meta.whereInput },
+    orderBy: { type: meta.orderByInput },
+    limit: { type: GraphQLInt },
+    offset: { type: GraphQLInt },
   };
+}
 
-  queryFields[`${meta.jsKey}Single`] = {
+/** `Query.<jsKey>(where?, orderBy?, limit?, offset?)` — paginated list. */
+function buildListQueryField(meta: TableMeta, db: DrizzleLike): GraphQLFieldConfig<unknown, unknown> {
+  return {
+    type: listType(meta),
+    args: listArgsConfig(meta),
+    resolve: (_, args) =>
+      applyListArgs(db.select().from(meta.table), args, meta.columns),
+  };
+}
+
+/** `Query.<jsKey>Single(where?, orderBy?)` — first matching row or null. */
+function buildSingleQueryField(meta: TableMeta, db: DrizzleLike): GraphQLFieldConfig<unknown, unknown> {
+  return {
     type: meta.objectType,
     args: { where: { type: meta.whereInput }, orderBy: { type: meta.orderByInput } },
     resolve: async (_, args) => {
-      const order = orderByToSql(args?.orderBy, meta.columns);
-      let q = db.select().from(meta.table).where(whereToSql(args?.where, meta.columns)).limit(1);
-      if (order.length) q = q.orderBy(...order);
-      const rows = await q;
+      const rows = await applyListArgs(
+        db.select().from(meta.table),
+        args,
+        meta.columns,
+      ).limit(1);
       return rows[0] ?? null;
     },
   };
+}
 
-  mutationFields[`insertInto${meta.typeName}`] = {
-    type: listType,
+/** `Mutation.insertInto<TypeName>(values)` — bulk insert, returns inserted rows. */
+function buildInsertMutationField(meta: TableMeta, db: DrizzleLike): GraphQLFieldConfig<unknown, unknown> {
+  return {
+    type: listType(meta),
     args: {
       values: {
         type: new GraphQLNonNull(
@@ -459,37 +445,37 @@ function addRootFields(
         ),
       },
     },
-    resolve: async (_, args) => {
-      const rows = await db.insert(meta.table).values(args.values).returning();
-      return rows;
-    },
+    resolve: async (_, args) =>
+      db.insert(meta.table).values(args.values).returning(),
   };
+}
 
-  mutationFields[`update${meta.typeName}`] = {
-    type: listType,
+/** `Mutation.update<TypeName>(set, where?)` — partial update, returns affected rows. */
+function buildUpdateMutationField(meta: TableMeta, db: DrizzleLike): GraphQLFieldConfig<unknown, unknown> {
+  return {
+    type: listType(meta),
     args: {
       set: { type: new GraphQLNonNull(meta.updateInput) },
       where: { type: meta.whereInput },
     },
-    resolve: async (_, args) => {
-      const rows = await db
+    resolve: async (_, args) =>
+      db
         .update(meta.table)
         .set(args.set)
         .where(whereToSql(args?.where, meta.columns))
-        .returning();
-      return rows;
-    },
+        .returning(),
   };
+}
 
-  mutationFields[`deleteFrom${meta.typeName}`] = {
-    type: listType,
+/** `Mutation.deleteFrom<TypeName>(where?)` — delete by predicate, returns deleted rows. */
+function buildDeleteMutationField(meta: TableMeta, db: DrizzleLike): GraphQLFieldConfig<unknown, unknown> {
+  return {
+    type: listType(meta),
     args: { where: { type: meta.whereInput } },
-    resolve: async (_, args) => {
-      const rows = await db
+    resolve: async (_, args) =>
+      db
         .delete(meta.table)
         .where(whereToSql(args?.where, meta.columns))
-        .returning();
-      return rows;
-    },
+        .returning(),
   };
 }

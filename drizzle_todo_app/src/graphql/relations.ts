@@ -45,6 +45,7 @@ import {
   Table,
   type Column,
 } from "drizzle-orm";
+import { jsKeyOf } from "./util.js";
 
 /**
  * Symbols Drizzle uses to attach inline foreign keys to a table instance, one
@@ -57,12 +58,6 @@ const INLINE_FK_SYMBOLS = [
   Symbol.for("drizzle:PgInlineForeignKeys"),
   Symbol.for("drizzle:MySqlInlineForeignKeys"),
 ];
-
-/** Reverse-lookup the JS key of a column inside a `{ jsKey: Column }` map. */
-function jsKeyOf(columns: Record<string, Column>, target: Column): string | undefined {
-  for (const [k, c] of Object.entries(columns)) if (c === target) return k;
-  return undefined;
-}
 
 /**
  * Read inline FKs from a Drizzle table regardless of dialect.
